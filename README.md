@@ -25,6 +25,25 @@ produce different behavior; they are not calibrated Elo ratings.
 Each character reacts with offline, curated commentary. Placeholder avatars
 live under `static/avatars/`. The final reaction remains visible during review.
 
+## Talking back to the bots
+
+After each bot comment you can type one reply and the bot answers back once,
+in character, via `POST /banter`. This is powered by the Anthropic API and
+needs an API key:
+
+```bash
+export ANTHROPIC_API_KEY="sk-ant-..."
+```
+
+Without the key the app still runs — `/banter` serves a canned fallback line
+and the game is unaffected. On Render, set `ANTHROPIC_API_KEY` in the
+dashboard (it is declared with `sync: false` in `render.yaml` so the value is
+never committed).
+
+Banter is deliberately bounded: one reply per bot comment, max 10 exchanges
+per game, replies capped at 280 characters, and the transcript lives only in
+the Flask session for the current game (cleared on new/end game).
+
 ## Opening play and search
 
 Book policy is applied before search and blunders. If the policy permits a book

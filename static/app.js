@@ -237,6 +237,10 @@ const elements = {
   board: document.querySelector("#myBoard"),
   boardOverlay: document.querySelector("#boardOverlay"),
   botCommentary: document.querySelector("#botCommentary"),
+  banterForm: document.querySelector("#banterForm"),
+  banterInput: document.querySelector("#banterInput"),
+  banterSend: document.querySelector("#banterSend"),
+  banterThinking: document.querySelector("#banterThinking"),
   botButtons: document.querySelectorAll("[data-bot]"),
   botSelectorHeading: document.querySelector("#botSelectorHeading"),
   botSelectionStatus: document.querySelector("#botSelectionStatus"),
@@ -340,6 +344,8 @@ let selectedBot = {
 };
 let opponentSelected = false;
 let gameActive = false;
+let banterExchangeIndex = null;
+let banterBusy = false;
 let isStartingGame = false;
 let botRequestInFlight = false;
 let currentCommentary = "";
@@ -411,6 +417,7 @@ function initialize() {
   elements.copyPlanButton.addEventListener("click", copyPlanningSequence);
   elements.retryButton.addEventListener("click", requestEngineMove);
   elements.reconnectButton.addEventListener("click", reconnectOpponent);
+  elements.banterForm.addEventListener("submit", submitBanter);
   elements.cancelPromotionButton.addEventListener("click", cancelPromotion);
   elements.promotionDialog.addEventListener("cancel", cancelPromotion);
   elements.promotionDialog.addEventListener("keydown", handlePromotionShortcut);
@@ -561,7 +568,11 @@ function renderSelectedBot(data) {
   elements.opponentAvatar.src = `/static/avatars/${encodeURIComponent(selectedBot.avatar)}`;
   elements.opponentAvatar.alt = `${selectedBot.label} avatar`;
   elements.opponentAvatar.hidden = false;
-  updateCommentary(data.commentary, data.commentary_trigger || "default");
+  updateCommentary(
+    data.commentary,
+    data.commentary_trigger || "default",
+    data.banter_exchange_index ?? null,
+  );
 }
 
 function renderBotSelector() {
@@ -577,12 +588,70 @@ function renderBotLockMessage() {
   }
 }
 
-function updateCommentary(line, trigger = "default") {
+function updateCommentary(line, trigger = "default", banterIndex = null) {
   if (typeof line !== "string" || !line.trim()) {
     return;
   }
   currentCommentary = line.trim();
   animationDirector.showCommentary(currentCommentary, trigger);
+  setBanterAvailability(banterIndex);
+}
+
+function setBanterAvailability(index) {
+  banterExchangeIndex = Number.isInteger(index) ? index : null;
+  const canChat =
+    banterExchangeIndex !== null && opponentSelected && gameActive && !banterBusy;
+  elements.banterForm.hidden = !canChat;
+  if (selectedBot.label) {
+    elements.banterInput.placeholder = `Reply to ${selectedBot.label}…`;
+    elements.banterInput.setAttribute(
+      "aria-label",
+      `Reply to ${selectedBot.label}`,
+    );
+  }
+  if (banterExchangeIndex === null) {
+    elements.banterInput.value = "";
+    elements.banterThinking.hidden = true;
+  }
+}
+
+async function submitBanter(event) {
+  event.preventDefault();
+  if (banterBusy || banterExchangeIndex === null) {
+    return;
+  }
+  const reply = elements.banterInput.value.trim();
+  if (!reply) {
+    elements.banterInput.focus();
+    return;
+  }
+  banterBusy = true;
+  elements.banterInput.disabled = true;
+  elements.banterSend.disabled = true;
+  elements.banterForm.hidden = true;
+  elements.banterThinking.hidden = false;
+  try {
+    const response = await fetch("/banter", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ fen: game.fen(), reply: reply.slice(0, 280) }),
+    });
+    const data = await response.json().catch(() => ({}));
+    if (response.ok && typeof data.martin_response === "string" && data.martin_response.trim()) {
+      updateCommentary(data.martin_response, "banter", null);
+    } else {
+      // Server rejected the reply (stale exchange, rate limit, …): the next
+      // bot comment will re-open the input, so just stand down quietly.
+      setBanterAvailability(null);
+    }
+  } catch (error) {
+    setBanterAvailability(null);
+  } finally {
+    banterBusy = false;
+    elements.banterInput.disabled = false;
+    elements.banterSend.disabled = false;
+    elements.banterThinking.hidden = true;
+  }
 }
 
 function clearCommentary() {
@@ -590,6 +659,7 @@ function clearCommentary() {
   animationDirector.skip();
   elements.botCommentary.textContent = "";
   elements.botCommentary.hidden = true;
+  setBanterAvailability(null);
 }
 
 function showNextIdleCommentary() {
@@ -1293,7 +1363,11 @@ async function requestEngineMove() {
 
     stopThinkingCommentary();
     if (typeof data.commentary === "string" && data.commentary.trim()) {
-      updateCommentary(data.commentary, data.commentary_trigger || "default");
+      updateCommentary(
+        data.commentary,
+        data.commentary_trigger || "default",
+        data.banter_exchange_index ?? null,
+      );
     } else {
       restoreCommentary(commentaryBeforeThinking);
     }
