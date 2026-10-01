@@ -59,6 +59,7 @@ class WebAppTests(unittest.TestCase):
                 b"banterInput",
                 b"banterSend",
                 b"banterThinking",
+                b"banterStatus",
             ):
                 with self.subTest(element_id=element_id):
                     self.assertIn(b'id="' + element_id + b'"', response.data)
@@ -281,7 +282,7 @@ class WebAppTests(unittest.TestCase):
                 "outcome": None,
                 "commentary": None,
                 "commentary_trigger": None,
-                "banter_exchange_index": None,
+                "banter_exchange_index": 0,
                 "avatar": "professor.png",
             },
         )
@@ -359,6 +360,7 @@ class WebAppTests(unittest.TestCase):
             response = self.client.post("/move", json={"fen": board.fen()})
 
         self.assertTrue(response.get_json()["game_over"])
+        self.assertIsNone(response.get_json()["banter_exchange_index"])
         speak.assert_called_once_with("professor", "checkmate_win")
 
     def test_move_endpoint_uses_selected_bot_skill(self) -> None:
@@ -713,22 +715,29 @@ class BanterEndpointTests(unittest.TestCase):
         self.client = web_app.app.test_client()
         self.client.post("/select_bot", json={"bot_id": "martin"})
 
-    def _seed_game(self, banter):
+    def _seed_game(self, exchange_count=1, pending_index=0, last_reply_at=None):
         with self.client.session_transaction() as session:
             session["opponent_selected"] = True
             session["game_started"] = True
             session["active_game_bot"] = "martin"
-            session["banter"] = banter
+            session["banter_state"] = {
+                "exchange_count": exchange_count,
+                "pending": (
+                    {
+                        "index": pending_index,
+                        "comment": "Don't mind if I do.",
+                    }
+                    if pending_index is not None
+                    else None
+                ),
+                "last_reply_at": last_reply_at,
+            }
 
-    def _awaiting_entry(self, created_at=None):
-        return {
-            "ply": 4,
-            "martin_comment": "Don't mind if I do.",
-            "user_reply": None,
-            "martin_response": None,
-            "status": "awaiting_reply",
-            "created_at": created_at if created_at is not None else time.time() - 30,
-        }
+    def _send_reply(self, reply="hi", exchange_index=0, **payload):
+        return self.client.post(
+            "/banter",
+            json={"exchange_index": exchange_index, "reply": reply, **payload},
+        )
 
     def test_banter_requires_active_game(self) -> None:
         fresh = web_app.app.test_client()
@@ -736,96 +745,111 @@ class BanterEndpointTests(unittest.TestCase):
         self.assertEqual(response.status_code, 409)
 
     def test_banter_requires_game_started(self) -> None:
-        # select_bot alone does not start the game.
-        self._seed_game([])
+        self._seed_game()
         with self.client.session_transaction() as session:
             session["game_started"] = False
-        response = self.client.post("/banter", json={"reply": "hi"})
+        response = self._send_reply()
         self.assertEqual(response.status_code, 409)
 
     def test_banter_requires_awaiting_reply(self) -> None:
-        self._seed_game([])
-        response = self.client.post("/banter", json={"reply": "hi"})
+        self._seed_game(pending_index=None)
+        response = self._send_reply()
         self.assertEqual(response.status_code, 409)
 
-    def test_banter_rejects_completed_exchange(self) -> None:
-        entry = self._awaiting_entry()
-        entry["status"] = "complete"
-        entry["user_reply"] = "nice"
-        entry["martin_response"] = "thanks"
-        self._seed_game([entry])
-        response = self.client.post("/banter", json={"reply": "again"})
+    def test_banter_rejects_stale_exchange_index(self) -> None:
+        self._seed_game(exchange_count=2, pending_index=1)
+        response = self._send_reply(exchange_index=0)
         self.assertEqual(response.status_code, 409)
 
     def test_banter_rejects_empty_reply(self) -> None:
-        self._seed_game([self._awaiting_entry()])
-        response = self.client.post("/banter", json={"reply": "   "})
+        self._seed_game()
+        response = self._send_reply(reply="   ")
         self.assertEqual(response.status_code, 400)
 
     def test_banter_rejects_oversized_reply(self) -> None:
-        self._seed_game([self._awaiting_entry()])
-        response = self.client.post(
-            "/banter", json={"reply": "x" * (web_app.BANTER_REPLY_MAX_CHARS + 1)}
+        self._seed_game()
+        response = self._send_reply(
+            reply="x" * (web_app.BANTER_REPLY_MAX_CHARS + 1)
         )
         self.assertEqual(response.status_code, 400)
 
     def test_banter_returns_llm_response_and_marks_complete(self) -> None:
-        self._seed_game([self._awaiting_entry()])
+        self._seed_game()
         with patch("app._martin_banter_reply", return_value="Mocked zinger."):
-            response = self.client.post(
-                "/banter",
-                json={"reply": "lucky", "fen": chess.STARTING_FEN},
-            )
+            response = self._send_reply(reply="lucky", fen=chess.STARTING_FEN)
         self.assertEqual(response.status_code, 200)
         payload = response.get_json()
         self.assertEqual(payload["martin_response"], "Mocked zinger.")
         self.assertEqual(payload["exchange_index"], 0)
         with self.client.session_transaction() as session:
-            entry = session["banter"][0]
-        self.assertEqual(entry["status"], "complete")
-        self.assertEqual(entry["user_reply"], "lucky")
-        self.assertEqual(entry["martin_response"], "Mocked zinger.")
+            state = session["banter_state"]
+        self.assertIsNone(state["pending"])
+        self.assertEqual(state["exchange_count"], 1)
+        self.assertIsInstance(state["last_reply_at"], (int, float))
 
     def test_banter_falls_back_when_llm_fails(self) -> None:
-        self._seed_game([self._awaiting_entry()])
+        self._seed_game()
         with patch("app._martin_banter_reply", side_effect=RuntimeError("no key")):
-            response = self.client.post("/banter", json={"reply": "lucky"})
+            response = self._send_reply(reply="lucky")
         self.assertEqual(response.status_code, 200)
         self.assertIn(
             response.get_json()["martin_response"], web_app.BANTER_FALLBACK_LINES
         )
 
     def test_banter_enforces_rate_limit(self) -> None:
-        self._seed_game([self._awaiting_entry(created_at=time.time())])
-        response = self.client.post("/banter", json={"reply": "too fast"})
+        self._seed_game(last_reply_at=time.time())
+        response = self._send_reply(reply="too fast")
         self.assertEqual(response.status_code, 429)
+        self.assertIn(response.headers["Retry-After"], {"1", "2"})
+        with self.client.session_transaction() as session:
+            self.assertIsNotNone(session["banter_state"]["pending"])
 
-    def test_banter_enforces_per_game_cap(self) -> None:
-        entries = []
-        for index in range(web_app.BANTER_EXCHANGES_PER_GAME):
-            entry = self._awaiting_entry()
-            entry["ply"] = index
-            if index < web_app.BANTER_EXCHANGES_PER_GAME - 1:
-                entry["status"] = "complete"
-            entries.append(entry)
-        self._seed_game(entries)
-        response = self.client.post("/banter", json={"reply": "one more"})
-        self.assertEqual(response.status_code, 429)
-        self.assertIn("enough", response.get_json()["error"])
+    def test_newly_available_comment_is_not_rate_limited(self) -> None:
+        self._seed_game(last_reply_at=None)
+        with patch("app._martin_banter_reply", return_value="Not too soon after all."):
+            response = self._send_reply(reply="immediate")
+        self.assertEqual(response.status_code, 200)
 
-    def test_banter_log_is_trimmed_to_cap(self) -> None:
-        entries = [self._awaiting_entry() for _ in range(web_app.BANTER_EXCHANGES_PER_GAME)]
-        self._seed_game(entries)
-        # A fresh bot selection records a new comment, trimming the oldest entry.
-        fresh = web_app.app.test_client()
-        with fresh.session_transaction() as session:
-            session["banter"] = entries
-        fresh.post("/select_bot", json={"bot_id": "martin"})
-        with fresh.session_transaction() as session:
-            banter = session["banter"]
-        self.assertEqual(len(banter), web_app.BANTER_EXCHANGES_PER_GAME)
-        self.assertEqual(banter[-1]["martin_comment"], session.get("last_commentary"))
-        self.assertEqual(banter[-1]["status"], "awaiting_reply")
+    def test_tenth_exchange_is_allowed_and_transcript_is_not_stored(self) -> None:
+        self._seed_game(
+            exchange_count=web_app.BANTER_EXCHANGES_PER_GAME,
+            pending_index=web_app.BANTER_EXCHANGES_PER_GAME - 1,
+        )
+        with patch("app._martin_banter_reply", return_value="x" * 500):
+            response = self._send_reply(
+                reply="tenth",
+                exchange_index=web_app.BANTER_EXCHANGES_PER_GAME - 1,
+            )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            response.get_json()["exchange_index"],
+            web_app.BANTER_EXCHANGES_PER_GAME - 1,
+        )
+        self.assertEqual(
+            len(response.get_json()["martin_response"]),
+            web_app.BANTER_REPLY_MAX_CHARS,
+        )
+        cookie_header = response.headers.get("Set-Cookie", "")
+        self.assertLess(len(cookie_header.encode("utf-8")), 4093)
+        with self.client.session_transaction() as session:
+            state = session["banter_state"]
+            self.assertNotIn("banter", session)
+        self.assertEqual(state["exchange_count"], web_app.BANTER_EXCHANGES_PER_GAME)
+        self.assertIsNone(state["pending"])
+        self.assertEqual(self._send_reply(reply="eleventh").status_code, 409)
+
+    def test_comments_after_the_tenth_exchange_are_not_replyable(self) -> None:
+        with web_app.app.test_request_context("/"):
+            web_app.session["banter_state"] = {
+                "exchange_count": web_app.BANTER_EXCHANGES_PER_GAME,
+                "pending": {
+                    "index": web_app.BANTER_EXCHANGES_PER_GAME - 1,
+                    "comment": "The tenth comment.",
+                },
+                "last_reply_at": None,
+            }
+            self.assertIsNone(web_app._record_banter_comment("One more comment."))
+            self.assertIsNone(web_app._pending_banter_index())
 
     def test_move_records_commentary_as_banter_entry(self) -> None:
         capture_fen = (
@@ -845,27 +869,65 @@ class BanterEndpointTests(unittest.TestCase):
         self.assertIsNotNone(payload["commentary"])
         self.assertEqual(payload["banter_exchange_index"], 1)
         with self.client.session_transaction() as session:
-            banter = session["banter"]
-        self.assertEqual(len(banter), 2)
-        self.assertEqual(banter[1]["status"], "awaiting_reply")
-        self.assertEqual(banter[1]["martin_comment"], payload["commentary"])
+            state = session["banter_state"]
+        self.assertEqual(state["exchange_count"], 2)
+        self.assertEqual(state["pending"]["index"], 1)
+        self.assertEqual(state["pending"]["comment"], payload["commentary"])
+
+    def test_opening_comment_is_not_advertised_until_game_starts(self) -> None:
+        self.client.post("/new_game")
+        selection = self.client.post("/select_bot", json={"bot_id": "martin"})
+        self.assertIsNone(selection.get_json()["banter_exchange_index"])
+        response = self._send_reply()
+        self.assertEqual(response.status_code, 409)
+
+    def test_opening_comment_becomes_replyable_after_first_bot_move(self) -> None:
+        self.client.post("/new_game")
+        self.client.post("/select_bot", json={"bot_id": "martin"})
+        board = chess.Board()
+        board.push_uci("e2e4")
+        result = SearchResult(
+            move=chess.Move.from_uci("e7e5"),
+            score=0,
+            nodes=1,
+            depth=1,
+        )
+        with (
+            patch("app.choose_move_with_skill", return_value=result),
+            patch("app._resolve_commentary_payload", return_value=(None, None, None)),
+        ):
+            response = self.client.post("/move", json={"fen": board.fen()})
+        self.assertEqual(response.get_json()["banter_exchange_index"], 0)
+        with patch("app._martin_banter_reply", return_value="Fair enough."):
+            reply_response = self._send_reply()
+        self.assertEqual(reply_response.status_code, 200)
+
+    def test_terminal_comment_is_not_advertised_as_replyable(self) -> None:
+        response = self.client.post(
+            "/end_game",
+            json={"fen": "7k/6Q1/6K1/8/8/8/8/8 b - - 0 1"},
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertIsNone(response.get_json()["banter_exchange_index"])
+        with self.client.session_transaction() as session:
+            self.assertNotIn("banter_state", session)
 
     def test_banter_cleared_on_new_game(self) -> None:
-        self._seed_game([self._awaiting_entry()])
+        self._seed_game()
         response = self.client.post("/new_game")
         self.assertEqual(response.status_code, 200)
         with self.client.session_transaction() as session:
-            self.assertNotIn("banter", session)
+            self.assertNotIn("banter_state", session)
 
     def test_banter_cleared_on_end_game(self) -> None:
-        self._seed_game([self._awaiting_entry()])
+        self._seed_game()
         checkmate_fen = (
             "rnb1kbnr/pppp1ppp/8/4p3/6Pq/5P2/PPPPP2P/RNBQKBNR w KQkq - 1 3"
         )
         response = self.client.post("/end_game", json={"fen": checkmate_fen})
         self.assertEqual(response.status_code, 200)
         with self.client.session_transaction() as session:
-            self.assertNotIn("banter", session)
+            self.assertNotIn("banter_state", session)
 
     def test_banter_system_prompt_is_character_locked(self) -> None:
         prompt = web_app._banter_system_prompt("martin", chess.Board())

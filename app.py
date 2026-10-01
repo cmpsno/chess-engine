@@ -36,11 +36,12 @@ BOTS = {
 }
 
 # ---- Talk-back-to-Martin banter (Issue #46) ---------------------------------
-# Bounded one-reply-per-comment exchanges, stored in the Flask session for the
-# current game only. The LLM call must happen server-side: the API key never
-# reaches the browser.
+# Bounded one-reply-per-comment state is stored in the Flask session for the
+# current game only. The session keeps only a single pending comment, not a
+# transcript, so its signed cookie stays small. The LLM call must happen
+# server-side: the API key never reaches the browser.
 BANTER_REPLY_MAX_CHARS = 280
-BANTER_EXCHANGES_PER_GAME = 10          # also the session-trim cap
+BANTER_EXCHANGES_PER_GAME = 10
 BANTER_RATE_LIMIT_SECONDS = 2.0
 BANTER_LLM_MODEL = "claude-haiku-4-5-20251001"
 BANTER_LLM_MAX_TOKENS = 100
@@ -78,7 +79,6 @@ def select_bot():
     _reset_stale_opponent()
     opening_commentary = None
     opening_trigger = None
-    opening_banter_index = None
     if request.method == "POST":
         payload = request.get_json(silent=True)
         if not isinstance(payload, dict):
@@ -104,8 +104,13 @@ def select_bot():
         session["game_started"] = False
         session["commentary_eval"] = evaluate_board(chess.Board())
         session["commentary_tick"] = 0
+        session["banter_state"] = {
+            "exchange_count": 0,
+            "pending": None,
+            "last_reply_at": None,
+        }
         session.pop("last_commentary", None)
-        opening_commentary, opening_trigger, opening_banter_index = (
+        opening_commentary, opening_trigger, _ = (
             _resolve_commentary_payload(bot_id, "game_start")
         )
 
@@ -141,7 +146,11 @@ def select_bot():
             "tier": personality.tier,
             "commentary": opening_commentary,
             "commentary_trigger": opening_trigger,
-            "banter_exchange_index": opening_banter_index,
+            "banter_exchange_index": (
+                _pending_banter_index()
+                if session.get("game_started", False)
+                else None
+            ),
             "avatar": personality.avatar,
             "idle_lines": personality.lines.get("idle", []),
         }
@@ -181,7 +190,7 @@ def end_game():
     bot_id = _valid_session_bot_id()
     outcome = board.outcome()
     trigger = _terminal_commentary_trigger(outcome, chess.BLACK)
-    commentary, commentary_trigger, banter_index = (
+    commentary, commentary_trigger, _banter_index = (
         _resolve_commentary_payload(bot_id, trigger)
         if bot_id and trigger
         else (None, None, None)
@@ -194,7 +203,7 @@ def end_game():
             "needs_selection": True,
             "commentary": commentary,
             "commentary_trigger": commentary_trigger,
-            "banter_exchange_index": banter_index,
+            "banter_exchange_index": None,
             "avatar": avatar,
         }
     )
@@ -233,7 +242,7 @@ def handle_move():
     if board.is_game_over():
         outcome = board.outcome()
         trigger = _terminal_commentary_trigger(outcome, bot_color)
-        commentary, commentary_trigger, banter_index = (
+        commentary, commentary_trigger, _banter_index = (
             _resolve_commentary_payload(bot_id, trigger)
             if trigger
             else (None, None, None)
@@ -254,7 +263,7 @@ def handle_move():
                 "outcome": _outcome_payload(outcome),
                 "commentary": commentary,
                 "commentary_trigger": commentary_trigger,
-                "banter_exchange_index": banter_index,
+                "banter_exchange_index": None,
                 "avatar": personality.avatar,
             }
         )
@@ -342,6 +351,10 @@ def handle_move():
         if trigger
         else (None, None, None)
     )
+    if banter_index is None and not game_over:
+        banter_index = _pending_banter_index()
+    if game_over:
+        banter_index = None
     if game_over:
         _clear_opponent_selection()
 
@@ -367,10 +380,9 @@ def handle_move():
 def handle_banter():
     """Return one LLM-generated Martin response to the player's reply.
 
-    Bounded by design: exactly one reply per Martin comment (``awaiting_reply``
-    entry in ``session["banter"]``), per-game cap, rate limit, and a canned
-    fallback line whenever the LLM is unavailable. Talking to Martin is always
-    optional and never gates move submission.
+    Bounded by design: one reply per comment, up to ten exchanges per game,
+    and a two-second interval between accepted replies. A canned fallback is
+    returned whenever the LLM is unavailable. Banter never gates moves.
     """
     _reset_stale_opponent()
     if not (session.get("opponent_selected", False) and session.get("game_started", False)):
@@ -398,27 +410,33 @@ def handle_banter():
             candidate = None
         board = candidate if candidate is not None and candidate.is_valid() else None
 
-    banter = _banter_log()
-    pending = next(
-        (entry for entry in reversed(banter) if entry.get("status") == "awaiting_reply"),
-        None,
-    )
+    state = _banter_state()
+    pending = state["pending"]
     if pending is None:
         return _error("Martin hasn't said anything you can reply to yet.", 409)
+    exchange_index = payload.get("exchange_index")
+    if (
+        not isinstance(exchange_index, int)
+        or isinstance(exchange_index, bool)
+        or exchange_index != pending["index"]
+    ):
+        return _error("That comment is no longer available to reply to.", 409)
 
-    if len(banter) >= BANTER_EXCHANGES_PER_GAME:
-        return _error("Martin's had enough banter for one game.", 429)
-
-    last_ts = float(pending.get("created_at") or 0)
-    if time.time() - last_ts < BANTER_RATE_LIMIT_SECONDS:
-        return _error("Give Martin a second to finish talking.", 429)
+    now = time.time()
+    last_reply_at = state["last_reply_at"]
+    if last_reply_at is not None and now - last_reply_at < BANTER_RATE_LIMIT_SECONDS:
+        retry_after = max(
+            1, int(BANTER_RATE_LIMIT_SECONDS - (now - last_reply_at) + 0.999)
+        )
+        response, status = _error("Give Martin a second before replying again.", 429)
+        response.headers["Retry-After"] = str(retry_after)
+        return response, status
 
     bot_id = _active_game_bot_id()
-    pending["status"] = "generating"
     try:
         martin_response = _martin_banter_reply(
             bot_id=bot_id,
-            martin_comment=pending.get("martin_comment") or "",
+            martin_comment=pending["comment"],
             reply=reply,
             board=board,
         )
@@ -426,16 +444,19 @@ def handle_banter():
         app.logger.exception("Banter LLM call failed for bot %s.", bot_id)
         martin_response = random.choice(BANTER_FALLBACK_LINES)
 
-    pending["user_reply"] = reply
-    pending["martin_response"] = martin_response
-    pending["status"] = "complete"
-    session["banter"] = banter
+    martin_response = martin_response.strip()
+    if not martin_response:
+        martin_response = random.choice(BANTER_FALLBACK_LINES)
+    martin_response = martin_response[:BANTER_REPLY_MAX_CHARS].rstrip()
+    state["pending"] = None
+    state["last_reply_at"] = now
+    session["banter_state"] = state
 
     return jsonify(
         {
             "status": "ok",
             "martin_response": martin_response,
-            "exchange_index": banter.index(pending),
+            "exchange_index": pending["index"],
         }
     )
 
@@ -533,6 +554,7 @@ def _clear_opponent_selection() -> None:
     session.pop("commentary_eval", None)
     session.pop("commentary_tick", None)
     session.pop("last_commentary", None)
+    session.pop("banter_state", None)
     session.pop("banter", None)
     session["game_started"] = False
 
@@ -576,35 +598,57 @@ def _pick_commentary(
     return line, trigger, exchange_index
 
 
-def _banter_log() -> list[dict]:
-    banter = session.get("banter")
-    return list(banter) if isinstance(banter, list) else []
+def _banter_state() -> dict:
+    state = session.get("banter_state")
+    if not isinstance(state, dict):
+        return {"exchange_count": 0, "pending": None, "last_reply_at": None}
+    try:
+        exchange_count = max(
+            0,
+            min(int(state.get("exchange_count", 0)), BANTER_EXCHANGES_PER_GAME),
+        )
+    except (TypeError, ValueError):
+        exchange_count = 0
+    pending = state.get("pending")
+    if (
+        not isinstance(pending, dict)
+        or not isinstance(pending.get("index"), int)
+        or isinstance(pending.get("index"), bool)
+        or not isinstance(pending.get("comment"), str)
+        or not 0 <= pending["index"] < BANTER_EXCHANGES_PER_GAME
+        or pending["index"] >= exchange_count
+    ):
+        pending = None
+    last_reply_at = state.get("last_reply_at")
+    if not isinstance(last_reply_at, (int, float)):
+        last_reply_at = None
+    return {
+        "exchange_count": exchange_count,
+        "pending": pending,
+        "last_reply_at": last_reply_at,
+    }
 
 
-def _record_banter_comment(line: str) -> int:
-    """Append a Martin comment as a new replyable banter exchange.
+def _pending_banter_index() -> int | None:
+    pending = _banter_state()["pending"]
+    return pending["index"] if pending is not None else None
 
-    Older entries still awaiting a reply expire: only the newest comment is
-    ever replyable, which keeps the exchange bounded at one reply per comment.
-    Returns the new entry's index in the trimmed log.
-    """
-    banter = _banter_log()
-    for entry in banter:
-        if isinstance(entry, dict) and entry.get("status") == "awaiting_reply":
-            entry["status"] = "expired"
-    banter.append(
-        {
-            "ply": int(session.get("commentary_tick", 0)),
-            "martin_comment": line,
-            "user_reply": None,
-            "martin_response": None,
-            "status": "awaiting_reply",
-            "created_at": time.time(),
+
+def _record_banter_comment(line: str) -> int | None:
+    """Replace the pending comment, allocating at most ten reply opportunities."""
+    state = _banter_state()
+    exchange_index = None
+    pending = None
+    if state["exchange_count"] < BANTER_EXCHANGES_PER_GAME:
+        exchange_index = state["exchange_count"]
+        pending = {
+            "index": exchange_index,
+            "comment": line[:BANTER_REPLY_MAX_CHARS],
         }
-    )
-    del banter[: max(0, len(banter) - BANTER_EXCHANGES_PER_GAME)]
-    session["banter"] = banter
-    return len(banter) - 1
+        state["exchange_count"] += 1
+    state["pending"] = pending
+    session["banter_state"] = state
+    return exchange_index
 
 
 def _banter_system_prompt(bot_id: str, board: chess.Board | None) -> str:

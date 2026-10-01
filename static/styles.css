@@ -575,6 +575,16 @@ h1 {
   display: none;
 }
 
+.banter-status {
+  margin: 8px 0 0;
+  color: var(--muted);
+  font-size: clamp(0.78rem, 1.7vw, 0.88rem);
+}
+
+.banter-status[hidden] {
+  display: none;
+}
+
 .captured-pieces:empty::after {
   color: var(--muted);
   content: "No captures yet";
