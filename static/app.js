@@ -1410,7 +1410,10 @@ async function requestEngineMove() {
         data.banter_exchange_index ?? null,
       );
     } else {
-      restoreCommentary(commentaryBeforeThinking);
+      restoreCommentary(
+        commentaryBeforeThinking,
+        data.banter_exchange_index ?? null,
+      );
     }
 
     if (!data.engine_move) {

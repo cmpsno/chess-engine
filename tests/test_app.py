@@ -881,7 +881,9 @@ class BanterEndpointTests(unittest.TestCase):
         response = self._send_reply()
         self.assertEqual(response.status_code, 409)
 
-    def test_opening_comment_becomes_replyable_after_first_bot_move(self) -> None:
+    def test_opening_comment_remains_replyable_after_move_without_new_commentary(
+        self,
+    ) -> None:
         self.client.post("/new_game")
         self.client.post("/select_bot", json={"bot_id": "martin"})
         board = chess.Board()
@@ -897,6 +899,7 @@ class BanterEndpointTests(unittest.TestCase):
             patch("app._resolve_commentary_payload", return_value=(None, None, None)),
         ):
             response = self.client.post("/move", json={"fen": board.fen()})
+        self.assertIsNone(response.get_json()["commentary"])
         self.assertEqual(response.get_json()["banter_exchange_index"], 0)
         with patch("app._martin_banter_reply", return_value="Fair enough."):
             reply_response = self._send_reply()
